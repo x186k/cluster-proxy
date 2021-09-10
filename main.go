@@ -7,23 +7,30 @@ import (
 	"crypto/rand"
 	"crypto/sha512"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/caddyserver/certmagic"
 	"github.com/spf13/pflag"
+	"golang.org/x/sys/unix"
 )
+
+type Endpoint struct {
+	hmackey    string
+	sfuFtlAddr *net.UDPAddr
+}
+
+var endpointMap = make(map[string]*Endpoint)
+var endpointMapMutex sync.Mutex
 
 func checkFatal(err error) {
 	if err != nil {
@@ -31,12 +38,7 @@ func checkFatal(err error) {
 		log.Fatalf("FATAL %s:%d %v", filepath.Base(fileName), fileLine, err)
 	}
 }
-func checkNotFatal(err error) {
-	if err != nil {
-		_, fileName, fileLine, _ := runtime.Caller(1)
-		log.Printf("NOTFATAL %s:%d %v", filepath.Base(fileName), fileLine, err)
-	}
-}
+
 func httpError(w http.ResponseWriter, err error) {
 	_, fileName, fileLine, _ := runtime.Caller(1)
 	m := fmt.Sprintf("httperr %s:%d %v", filepath.Base(fileName), fileLine, err)
@@ -45,38 +47,37 @@ func httpError(w http.ResponseWriter, err error) {
 	http.Error(w, m, http.StatusInternalServerError)
 }
 
-func checkFreeze(err error) {
-	if err != nil {
-		log.SetFlags(log.Flags() | log.Lshortfile)
-		log.Printf("FATAL %v", err) // log.Fatalf calls os.Exit(1)
-		select {}                   //freeze
-	}
-}
+var httpAddrPort = pflag.String("http", ":9999", "http addr:port")
 
-var udpconnout net.PacketConn
-
-var domain = pflag.String("domain", "", "https domain name")
+var xlog = log.New(os.Stderr, "XX", log.Lshortfile|log.LUTC|log.LstdFlags|log.Lmsgprefix)
 
 func main() {
-	var err error
-
-	udpconnout, err = net.ListenPacket("udp", ":0")
-	checkFatal(err)
 
 	pflag.Parse()
-	if *domain == "" {
+	if *httpAddrPort == "" {
 		checkFatal(fmt.Errorf("--domain not set, fatal"))
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/register-sfu", func(rw http.ResponseWriter, r *http.Request) {
-		buf, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			httpError(rw, err)
+	mux.HandleFunc("/register", func(rw http.ResponseWriter, r *http.Request) {
+		var err error
+
+		streamkey := r.PostFormValue("streamkey")
+		split := strings.Split(streamkey, "-")
+		if len(split) != 2 {
+			httpError(rw, fmt.Errorf("Invalid stream key, valid example format: 123-abc"))
 			return
 		}
-		ep := new(Endpoint)
-		err = json.Unmarshal(buf, &ep)
+		chanid := split[0]
+		hmackey := split[1]
+
+		port := r.PostFormValue("port")
+		if port == "" {
+			httpError(rw, fmt.Errorf("port not present in form"))
+			return
+		}
+
+		portint, err := strconv.Atoi(port)
 		if err != nil {
 			httpError(rw, err)
 			return
@@ -88,22 +89,34 @@ func main() {
 			return
 		}
 
-		xip := net.ParseIP(host)
-		if xip == nil {
+		sfuip := net.ParseIP(host)
+		if sfuip == nil {
 			httpError(rw, fmt.Errorf("bad ip %s", host))
 			return
 		}
 
-		ep.ip = xip
+		ep := &Endpoint{}
+
+		ep.hmackey = hmackey
+		ep.sfuFtlAddr.IP = sfuip
+		ep.sfuFtlAddr.Port = portint
+
 		endpointMapMutex.Lock()
-		endpointMap[ep.key] = ep
+		_, found := endpointMap[chanid]
+		endpointMap[chanid] = ep
 		endpointMapMutex.Unlock()
+
+		log.Printf("chanid:%s keylen:%d, from sfu at %s, overwrite:%v", chanid, len(ep.hmackey), r.RemoteAddr, found)
+
+		_, _ = rw.Write([]byte("OK"))
 	})
 
-	log.Print("starting certmagic listenAndServe() on:", *domain)
+	log.Print("starting listenAndServe() on ", *httpAddrPort)
 
 	go func() {
-		err = certmagic.HTTPS([]string{*domain}, mux)
+
+		err := http.ListenAndServe(*httpAddrPort, mux)
+
 		checkFatal(err)
 	}()
 
@@ -117,14 +130,14 @@ func main() {
 
 func ftlListener() {
 	config := &net.ListenConfig{}
-	ln, err := config.Listen(context.Background(), "tcp4", ":8084")
+	ln, err := config.Listen(context.Background(), "tcp", ":8084")
 	checkFatal(err)
 	defer ln.Close()
 
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			checkNotFatal(err)
+			log.Print(fmt.Errorf("ln.accept fail: %w", err))
 			time.Sleep(time.Second * 10)
 		}
 
@@ -132,18 +145,12 @@ func ftlListener() {
 			defer c.Close()
 
 			err := ftlSession(c)
-			log.Println(err.Error())
+			if err != nil {
+				log.Println(err.Error())
+			}
 		}()
 	}
 }
-
-type Endpoint struct {
-	ip  net.IP
-	key string
-}
-
-var endpointMap = make(map[string]*Endpoint)
-var endpointMapMutex sync.Mutex
 
 func ftlSession(tcpconn net.Conn) error {
 	var err error
@@ -182,8 +189,9 @@ func ftlSession(tcpconn net.Conn) error {
 	numrand := 128
 	message := make([]byte, numrand)
 	_, err = rand.Read(message)
-	// fatal, system has issues
-	checkFreeze(err)
+	if err != nil {
+		return fmt.Errorf("rand.Read failed %w", err)
+	}
 
 	fmt.Fprintf(tcpconn, "200 %s\n", hex.EncodeToString(message))
 
@@ -210,8 +218,11 @@ func ftlSession(tcpconn net.Conn) error {
 
 	userid := connectsplit[1]
 	connectMsg := "CONNECT " + userid + " $"
-	client_hash, err := hex.DecodeString(l[len(connectMsg):])
-	checkFatal(err)
+	hexval := l[len(connectMsg):]
+	client_hash, err := hex.DecodeString(hexval)
+	if err != nil {
+		return fmt.Errorf("bad data in connect user:%s data:%s", userid, hexval)
+	}
 
 	var ep *Endpoint
 	endpointMapMutex.Lock()
@@ -221,7 +232,7 @@ func ftlSession(tcpconn net.Conn) error {
 		return fmt.Errorf("Non existent userid presented %s", userid)
 	}
 
-	good := ValidMAC([]byte(ep.key), message, client_hash)
+	good := ValidMAC([]byte(ep.hmackey), message, client_hash)
 
 	log.Println("ftl: auth is okay:", good)
 
@@ -279,133 +290,49 @@ func ftlSession(tcpconn net.Conn) error {
 
 	fmt.Fprintf(tcpconn, "200. Use UDP port 8084\n")
 
-	addr, err := net.ResolveUDPAddr("udp4", ":8084")
-	if err != nil {
-		return err
-	}
-
-	// we cannot this
+	// we cannot do this
 	// net.DialUDP("udp",nil,)
 	// cause we don't know the remote port,
 	// we can do it in the read loop on the first packet.
 
-	udpconn, err := net.ListenUDP("udp4", addr)
-	if err != nil {
-		return err
-	}
-	defer udpconn.Close()
+	// open firewall hole
+	// we don't know the source host:port, so we CANNOT send
+	// (well, we don't know the port)
+	// a packet to open a firewall hole.
+	// this means port 8084 must be forwarded/open to udp traffic on
+	// the firewall
+	//udpconn.WriteToUDP()
 
 	pingchan := make(chan bool)
 	disconnectCh := make(chan bool)
 
 	// PING goroutine
 	// this will silently go away when the socket gets closed
-	go func() {
-		log.Println("ftl: ping responder running")
-		for scanner.Scan() {
-			l := scanner.Text()
 
-			// XXX PING is sometimes followed by streamkey-id
-			// but we don't validate it.
-			// it is checked for Connect message
-			if strings.HasPrefix(l, "PING ") {
-				log.Println("ftl: ping!")
-				fmt.Fprintf(tcpconn, "201\n")
+	log.Println("ftl: ping responder running")
+	for scanner.Scan() {
+		l := scanner.Text()
 
-				pingchan <- true
-			} else if l == "" {
-				//ignore blank
-			} else if l == "DISCONNECT" {
-				disconnectCh <- true
-			} else {
-				// unexpected
-				log.Println("ftl: unexpected msg:", l)
-			}
-		}
-		//silently finish goroutine on scanner error or socket close
-	}()
+		// XXX PING is sometimes followed by streamkey-id
+		// but we don't validate it.
+		// it is checked for Connect message
+		if strings.HasPrefix(l, "PING ") {
+			log.Println("ftl: ping!")
+			fmt.Fprintf(tcpconn, "201\n")
 
-	//XXX consider use of rtp.Packet pool
-	//println(999,buf[1],p.Header.PayloadType)
-	// default:
-	// 	checkFatal(fmt.Errorf("bad RTP payload from FTL: %d", p.Header.PayloadType))
-
-	lastping := time.Now()
-	lastudp := time.Now()
-	buf := make([]byte, 2000)
-
-	dst := &net.UDPAddr{
-		IP:   ep.ip,
-		Port: 8084,
-		Zone: "",
-	}
-
-	connected := false
-	for {
-
-		select {
-		case m, more := <-pingchan:
-			if m && more {
-				lastping = time.Now()
-			}
-		case <-disconnectCh:
-			log.Println("OBS/FTL: SERVER DISCONNECTED")
-			return nil
-		default:
-		}
-		if time.Since(lastping) > time.Second*11 {
-			log.Println("OBS/FTL: PINGING TIMEOUT, CLOSING")
-			return nil
-		}
-		if time.Since(lastudp) > time.Second*3/2 { // 1.5 second
-			log.Println("OBS/FTL: UDP/RX TIMEOUT, CLOSING")
-			return nil
-		}
-
-		err = udpconn.SetReadDeadline(time.Now().Add(time.Second))
-		checkFatal(err)
-		n, readaddr, err := udpconn.ReadFromUDP(buf)
-		if errors.Is(err, os.ErrDeadlineExceeded) {
-			continue
-		} else if err != nil {
-			log.Println(fmt.Errorf("OBS/FTL: UDP FAIL, CLOSING: %w", err))
-			return nil
-		}
-
-		//this increases security
-		if !connected {
-			connected = true
-
-			udpconn.Close()
-			addr, err := net.ResolveUDPAddr("udp4", ":8084")
-			if err != nil {
-				return err
-			}
-
-			udpconn, err = net.DialUDP("udp", addr, readaddr)
-			if err != nil {
-				return err
-			}
-		}
-
-		lastudp = time.Now()
-
-		if n < 12 {
-			continue
-		}
-
-		// we could have a single udp forwarder or many
-		// the way I see it is, that
-		// having many makes tcp session management easier
-		//udp timeouts become easy to propagate up the stack
-		// invoking defers etc for cleanup
-		// hopefully simpler, more robust design
-
-		_, err = udpconnout.WriteTo(buf[:n], dst)
-		if err != nil {
-			return err
+			pingchan <- true
+		} else if l == "" {
+			//ignore blank
+		} else if l == "DISCONNECT" {
+			disconnectCh <- true
+		} else {
+			// unexpected
+			log.Println("ftl: unexpected msg:", l)
 		}
 	}
+	//silently finish goroutine on scanner error or socket close
+
+	return scanner.Err()
 
 }
 
@@ -414,4 +341,78 @@ func ValidMAC(key, message, messageMAC []byte) bool {
 	mac.Write(message)
 	expectedMAC := mac.Sum(nil)
 	return hmac.Equal(messageMAC, expectedMAC)
+}
+
+type SfuInfo struct {
+	sfuaddr *net.UDPAddr
+	//badrtp  int
+	lastrx  time.Time
+	dead    bool
+}
+
+func udphandler() {
+
+	mm := make(map[string]*SfuInfo)
+
+	pc, err := net.ListenPacket("udp", ":8084")
+	checkFatal(err)
+
+	udp8084 := pc.(*net.UDPConn)
+
+	//XXX consider use of rtp.Packet pool
+	//println(999,buf[1],p.Header.PayloadType)
+	// default:
+	// 	checkFatal(fmt.Errorf("bad RTP payload from FTL: %d", p.Header.PayloadType))
+
+	buf := make([]byte, 2000)
+
+	for {
+
+		n, srcaddr, err := udp8084.ReadFromUDP(buf)
+		if err != nil {
+			// sad but fatal, crash everyone
+			checkFatal(fmt.Errorf(".ReadFromUDP err %w", err))
+		}
+
+		key := srcaddr.Network()
+
+		sfuinfo, found := mm[key]
+
+		if !found {
+			//look to see if we can find addr:port=0
+			addrport0 := net.UDPAddr{IP: srcaddr.IP, Port: 0, Zone: srcaddr.Zone}
+			sfuinfo, found = mm[addrport0.Network()]
+
+			if !found {
+				log.Printf("Unexpected pkt from:%s, routing to /dev/null", srcaddr.String())
+				mm[key] = &SfuInfo{} // no dest addr
+			} else {
+				log.Printf("First pkt from:%s, saving routing to %s", srcaddr.String(), key)
+				delete(mm, addrport0.Network())
+				mm[key] = sfuinfo
+			}
+
+		} else if found {
+			//sfuinfo.lastrx = time.Now()
+			//sfuinfo.nujrx++
+
+			if n < 12 {
+				//sfuinfo.badrtp++
+				continue
+			}
+
+			if sfuinfo.dead {
+				continue
+			}
+
+			_, err = udp8084.WriteTo(buf[:n], sfuinfo.sfuaddr)
+			if err != nil {
+				if errors.Is(err, unix.ECONNREFUSED) { // or windows.WSAECONNRESET
+					log.Printf("sfu %s not receiving, marking dead", srcaddr.String())
+					sfuinfo.dead = true
+					continue
+				}
+			}
+		}
+	}
 }

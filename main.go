@@ -34,37 +34,27 @@ type SfuInfo struct {
 var endpointMap = make(map[string]*SfuInfo)
 var endpointMapMutex sync.Mutex
 
-func checkFatal(err error) {
-	if err != nil {
-		_, fileName, fileLine, _ := runtime.Caller(1)
-		log.Fatalf("FATAL %s:%d %v", filepath.Base(fileName), fileLine, err)
-	}
-}
-func checkNotFatal(err error) {
-	if err != nil {
-		_, fileName, fileLine, _ := runtime.Caller(1)
-		log.Printf("NOTFATAL %s:%d %v", filepath.Base(fileName), fileLine, err)
-	}
-}
 func httpError(w http.ResponseWriter, err error) {
 	_, fileName, fileLine, _ := runtime.Caller(1)
 	tt := time.Now().Format(time.RFC3339)
-	m := fmt.Sprintf("httperr %s %s %d %v", tt, filepath.Base(fileName), fileLine, err)
-	log.Print(err)
-	http.Error(w, m, http.StatusInternalServerError)
+	m := fmt.Sprintf("httperr %v %v %v", filepath.Base(fileName), fileLine, err)
+	log.Print(tt)
+	log.Print(m)
+	http.Error(w, m+" "+tt, http.StatusInternalServerError)
 }
 
 var httphostport = pflag.String("http", "", "http addr:port, addr may be blank, ie: ':7777'")
+var registerUrl = pflag.String("url", "/", "at what url to accept SFU registrations")
 
 func main() {
 	var err error
 
-	log.SetFlags(log.Lshortfile | log.LUTC | log.LstdFlags | log.Lmsgprefix)
+	log.SetFlags(log.LUTC | log.LstdFlags | log.Lshortfile)
 
 	pflag.Parse()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/register", func(rw http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(*registerUrl, func(rw http.ResponseWriter, r *http.Request) {
 		var err error
 
 		streamkey := r.PostFormValue("streamkey")
@@ -91,7 +81,10 @@ func main() {
 			return
 		}
 
-		sfuaddr, err := net.ResolveUDPAddr("udp", host+":"+port)
+		hostport := host + ":" + port
+		log.Printf("sfu registered for user/%v at %v", a.userid, hostport)
+
+		sfuaddr, err := net.ResolveUDPAddr("udp", hostport)
 		if err != nil {
 			httpError(rw, err)
 			return
@@ -110,11 +103,13 @@ func main() {
 		_, _ = rw.Write([]byte("OK"))
 	})
 
-	log.Print("starting http listenAndServe() on:", *httphostport)
+	log.Print("starting http listenAndServe() on:", *httphostport, *registerUrl)
 
 	go func() {
 		err = http.ListenAndServe(*httphostport, mux)
-		checkFatal(err)
+		if err != nil {
+			log.Fatalln(err)
+		}
 	}()
 
 	go func() {
@@ -128,26 +123,26 @@ func main() {
 func ftlListener() {
 	config := &net.ListenConfig{}
 	ln, err := config.Listen(context.Background(), "tcp4", ":8084")
-	checkFatal(err)
+	if err != nil {
+		log.Fatalln(err)
+	}
 	defer ln.Close()
 
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			checkNotFatal(err)
+			log.Println(err)
 			time.Sleep(time.Second * 10)
 		}
 
 		go func() {
 			defer c.Close()
-
-			err := ftlSession(c)
-			log.Println(err.Error())
+			ftlSession(c)
 		}()
 	}
 }
 
-func ftlSession(tcpconn net.Conn) error {
+func ftlSession(tcpconn net.Conn) {
 	var err error
 
 	log.Println("OBS/FTL GOT TCP SOCKET CONNECTION")
@@ -157,27 +152,22 @@ func ftlSession(tcpconn net.Conn) error {
 	var l string
 
 	if !scanner.Scan() {
-		err = scanner.Err()
-		if err == nil {
-			return fmt.Errorf("EOF on OBS/FTL")
-		}
-		return err
+		reportScannerError(scanner)
+		return
 	}
 	if l = scanner.Text(); l != "HMAC" {
-		return fmt.Errorf("ftl/no hmac:%s", l)
+		log.Println("ftl/no hmac:", l)
+		return
 	}
 	log.Println("ftl: got hmac")
 
 	if !scanner.Scan() {
-		err = scanner.Err()
-		if err == nil {
-			return fmt.Errorf("EOF on OBS/FTL")
-		}
-		return err
+		reportScannerError(scanner)
+		return
 	}
 	if l = scanner.Text(); l != "" {
-		err = fmt.Errorf("ftl/no blank after hmac:%s", l)
-		return err
+		log.Println("ftl/no blank after hmac:", l)
+		return
 	}
 	log.Println("ftl: got hmac blank")
 
@@ -186,42 +176,42 @@ func ftlSession(tcpconn net.Conn) error {
 	_, err = crand.Read(message)
 	if err != nil {
 		log.Print(err)
-		return nil
+		return
 	}
 
 	fmt.Fprintf(tcpconn, "200 %s\n", hex.EncodeToString(message))
 
 	if !scanner.Scan() {
-		err = scanner.Err()
-		if err == nil {
-			return fmt.Errorf("EOF on OBS/FTL")
-		}
-		return err
+		reportScannerError(scanner)
+		return
 	}
 
 	if l = scanner.Text(); !strings.HasPrefix(l, "CONNECT ") {
-		err = fmt.Errorf("ftl/no connect:%s", l)
-		return err
+		log.Println("ftl/no connect:", l)
+		return
 	}
 	log.Println("ftl: got connect")
 
 	connectsplit := strings.Split(l, " ")
 	if len(connectsplit) < 3 {
-		err = fmt.Errorf("ftl: bad connect")
-		return err
+		log.Println("ftl: bad connect")
+		return
 	}
 
 	userid := connectsplit[1]
 	connectMsg := "CONNECT " + userid + " $"
 	client_hash, err := hex.DecodeString(l[len(connectMsg):])
-	checkFatal(err)
+	if err != nil {
+		log.Println(err)
+	}
 
 	endpointMapMutex.Lock()
 	sfuinfo, ok := endpointMap[userid]
 	endpointMapMutex.Unlock()
 
 	if !ok {
-		return fmt.Errorf("Non existent userid presented %s", userid)
+		log.Println("Non existent userid presented", userid)
+		return
 	}
 
 	good := ValidMAC([]byte(sfuinfo.hmackey), message, client_hash)
@@ -229,7 +219,8 @@ func ftlSession(tcpconn net.Conn) error {
 	log.Println("ftl: auth is okay:", good)
 
 	if !good {
-		return fmt.Errorf("FTL authentication failed for %s", userid)
+		log.Println("FTL authentication failed for", userid)
+		return
 	}
 
 	fmt.Fprintf(tcpconn, "200\n")
@@ -240,7 +231,7 @@ func ftlSession(tcpconn net.Conn) error {
 		select {
 		case <-time.NewTimer(5 * time.Second).C:
 			tcpconn.Close()
-			err = fmt.Errorf("ftl: timeout waiting for handshake")
+			log.Println("ftl: timeout waiting for handshake")
 			return
 		case <-z:
 			log.Println("ftl: handshake complete before timeout")
@@ -259,8 +250,8 @@ func ftlSession(tcpconn net.Conn) error {
 			if len(split) == 2 {
 				kvmap[split[0]] = split[1]
 			} else {
-				err = fmt.Errorf("ftl/bad format keyval section: %s", l)
-				return err
+				log.Println("ftl/bad format keyval section:", l)
+				return
 			}
 		}
 		//fmt.Println(">", l)
@@ -276,24 +267,24 @@ func ftlSession(tcpconn net.Conn) error {
 	keyvalsOK := true // todo
 	//do a consistency check of the key vals
 	if !keyvalsOK {
-		err = fmt.Errorf("ftl/issue with k/v pairs")
-		return err
+		log.Println("ftl/issue with k/v pairs")
+		return
 	}
 
 	// net.DialUDP("udp",nil,), not yet, cause we don't know remote port
 	x := net.UDPAddr{IP: nil, Port: 0, Zone: ""}
 	udpconn, err := net.ListenUDP("udp", &x)
 	if err != nil {
-		return err
+		log.Println(err)
+		return
 	}
 	defer udpconn.Close()
 
-	_, rxport, err := net.SplitHostPort(udpconn.LocalAddr().String())
-	if err != nil {
-		return err
-	}
+	laddr := udpconn.LocalAddr().(*net.UDPAddr)
 
-	fmt.Fprintf(tcpconn, "200. Use UDP port %s\n", rxport)
+	log.Println("bound inbound udp on", laddr)
+
+	fmt.Fprintf(tcpconn, "200. Use UDP port %d\n", laddr.Port)
 
 	pingchan := make(chan bool)
 	disconnectCh := make(chan bool)
@@ -339,26 +330,30 @@ func ftlSession(tcpconn net.Conn) error {
 			}
 		case <-disconnectCh:
 			log.Println("OBS/FTL: SERVER DISCONNECTED")
-			return nil
+			return
 		default:
 		}
 		if time.Since(lastping) > time.Second*11 {
 			log.Println("OBS/FTL: PINGING TIMEOUT, CLOSING")
-			return nil
+			return
 		}
 		if time.Since(lastudp) > time.Second*3/2 { // 1.5 second
 			log.Println("OBS/FTL: UDP/RX TIMEOUT, CLOSING")
-			return nil
+			return
 		}
 
 		err = udpconn.SetReadDeadline(time.Now().Add(time.Second))
-		checkFatal(err)
+		if err != nil {
+			log.Println(err)
+			return
+		}
+
 		n, readaddr, err := udpconn.ReadFromUDP(buf)
 		if errors.Is(err, os.ErrDeadlineExceeded) {
 			continue
 		} else if err != nil {
 			log.Println(fmt.Errorf("OBS/FTL: UDP FAIL, CLOSING: %w", err))
-			return nil
+			return
 		}
 
 		//this increases security,
@@ -367,15 +362,17 @@ func ftlSession(tcpconn net.Conn) error {
 		if !connected {
 			connected = true
 
-			udpconn.Close()
-			addr, err := net.ResolveUDPAddr("udp4", ":"+rxport)
+			err := udpconn.Close()
 			if err != nil {
-				return err
+				log.Println(err)
+				return
 			}
+			//XXX there may be a 1 in 1e6 race here
 
-			udpconn, err = net.DialUDP("udp", addr, readaddr)
+			udpconn, err = net.DialUDP("udp", laddr, readaddr)
 			if err != nil {
-				return err
+				log.Println(err)
+				return
 			}
 		}
 
@@ -405,6 +402,15 @@ func ftlSession(tcpconn net.Conn) error {
 		}
 	}
 
+}
+
+func reportScannerError(scanner *bufio.Scanner) {
+	err := scanner.Err()
+	if err == nil {
+		log.Println("EOF on OBS/FTL")
+	} else {
+		log.Println(err)
+	}
 }
 
 func ValidMAC(key, message, messageMAC []byte) bool {

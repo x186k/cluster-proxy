@@ -54,7 +54,7 @@ func httpError(w http.ResponseWriter, err error) {
 	http.Error(w, m, http.StatusInternalServerError)
 }
 
-var httphostport = pflag.String("http", ":7777", "http addr:port, addr may be blank,")
+var httphostport = pflag.String("http", "", "http addr:port, addr may be blank, ie: ':7777'")
 
 func main() {
 	var err error
@@ -110,7 +110,7 @@ func main() {
 		_, _ = rw.Write([]byte("OK"))
 	})
 
-	log.Print("starting certmagic listenAndServe() on:", *httphostport)
+	log.Print("starting http listenAndServe() on:", *httphostport)
 
 	go func() {
 		err = http.ListenAndServe(*httphostport, mux)

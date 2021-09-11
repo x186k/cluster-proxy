@@ -57,6 +57,11 @@ func main() {
 	mux.HandleFunc(*registerUrl, func(rw http.ResponseWriter, r *http.Request) {
 		var err error
 
+		if r.PostFormValue("ping") != "" {
+			_, _ = rw.Write([]byte("OK"))
+			return
+		}
+
 		streamkey := r.PostFormValue("streamkey")
 		split := strings.Split(streamkey, "-")
 		if len(split) != 2 {

@@ -1,0 +1,19 @@
+			// someday, maybe, just call syscall.Connect(fd),
+			// rather than close and-re-open
+			raw, err := udpconn.SyscallConn()
+			checkFatal(err)
+
+			lsa := syscall.SockaddrInet4{Port: readaddr.Port}
+			copy(lsa.Addr[:], readaddr.IP.To4())
+
+			fmt.Printf("pp %#v", lsa)
+
+			err2 := new(error)
+			*err2 = nil
+
+			err = raw.Control(func(fd uintptr) {
+				println(2222, fd)
+				*err2 = syscall.Connect(int(fd), &lsa)
+			})
+			checkFatal(err)
+			checkFatal(*err2)

@@ -2,22 +2,20 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/hmac"
 	crand "crypto/rand"
 	"crypto/sha512"
 	"encoding/hex"
+	"encoding/json"
 
 	"errors"
 	"fmt"
 
 	"log"
 	"net"
-	"net/http"
+
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -27,124 +25,37 @@ import (
 )
 
 type SfuInfo struct {
-	udptx   *net.UDPConn
-	userid  string
-	hmackey []byte
+	udptx     *net.UDPConn
+	Channelid string
+	Hmackey   []byte
 }
 
 var endpointMap = make(map[string]*SfuInfo)
 var endpointMapMutex sync.Mutex
 
-func httpError(w http.ResponseWriter, err error) {
-	_, fileName, fileLine, _ := runtime.Caller(1)
-	tt := time.Now().Format(time.RFC3339)
-	m := fmt.Sprintf("ftl-proxy: httperr %v %v %v", filepath.Base(fileName), fileLine, err)
-	log.Print(tt)
-	log.Print(m)
-	http.Error(w, m+" "+tt, http.StatusInternalServerError)
-}
-
-var httphostport = pflag.String("http", "", "http addr:port, addr may be blank, ie: ':7777'")
-var registerUrl = pflag.String("url", "/", "at what url to accept SFU registrations")
+var secret = pflag.StringP("secret", "s", "", "required: secret password for sfu registration")
 
 func main() {
-	var err error
 
 	log.SetFlags(log.LUTC | log.LstdFlags | log.Lshortfile)
 
 	pflag.Parse()
-
-	mux := http.NewServeMux()
-	mux.HandleFunc(*registerUrl, registrationHandler)
-
-	log.Print("starting http listenAndServe() on:", *httphostport, *registerUrl)
-
-	go func() {
-		err = http.ListenAndServe(*httphostport, mux)
-		if err != nil {
-			log.Fatalln(err)
-		}
-	}()
-
-	go func() {
-		ftlListener()
-	}()
-
-	select {}
-
-}
-
-func registrationHandler(rw http.ResponseWriter, r *http.Request) {
-	var err error
-
-	streamkey := r.PostFormValue("streamkey")
-	split := strings.Split(streamkey, "-")
-	if len(split) != 2 {
-		httpError(rw, fmt.Errorf("Invalid stream key, valid example format: 123-abc"))
+	if *secret == "" {
+		pflag.Usage()
 		return
 	}
 
-	a := SfuInfo{}
-
-	a.userid = split[0]
-	a.hmackey = []byte(split[1])
-
-	port := r.PostFormValue("port")
-	if port == "" {
-		httpError(rw, fmt.Errorf("port not present/valid in form"))
-		return
-	}
-
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		httpError(rw, err)
-		return
-	}
-
-	endpointMapMutex.Lock()
-	check, ok := endpointMap[a.userid]
-	endpointMapMutex.Unlock()
-
-	if ok {
-		if bytes.Equal(check.hmackey, a.hmackey) && check.userid == a.userid {
-			//log.Println("duplicate sfu registration")
-			_, _ = rw.Write([]byte("OK"))
-			return
-		}
-	}
-
-	hostport := host + ":" + port
-	log.Printf("sfu registered for user/%v at %v", a.userid, hostport)
-
-	sfuaddr, err := net.ResolveUDPAddr("udp", hostport)
-	if err != nil {
-		httpError(rw, err)
-		return
-	}
-
-	a.udptx, err = net.DialUDP("udp", nil, sfuaddr)
-	if err != nil {
-		httpError(rw, err)
-		return
-	}
-
-	endpointMapMutex.Lock()
-	endpointMap[a.userid] = &a
-	endpointMapMutex.Unlock()
-
-	_, _ = rw.Write([]byte("OK"))
-}
-
-func ftlListener() {
 	config := &net.ListenConfig{}
-	ln, err := config.Listen(context.Background(), "tcp4", ":8084")
+	ln, err := config.Listen(context.Background(), "tcp", ":8084")
 	if err != nil {
 		log.Fatalln(err)
 	}
 	defer ln.Close()
 
 	for {
-		c, err := ln.Accept()
+		log.Println("waiting for accept")
+
+		netconn, err := ln.Accept()
 		if err != nil {
 			log.Println(err)
 			time.Sleep(time.Second * 10)
@@ -152,19 +63,33 @@ func ftlListener() {
 
 		log.Println("socket accepted")
 
+		tcpconn := netconn.(*net.TCPConn)
+
 		go func() {
-			defer c.Close()
-			ftlSession(c)
+			defer netconn.Close()
+			tcpSession(tcpconn)
 		}()
 	}
 }
 
-func ftlSession(tcpconn net.Conn) {
+func tcpSession(tcpconn *net.TCPConn) {
 	var err error
+
+	err = tcpconn.SetKeepAlive(true)
+	if err != nil {
+		log.Println("SetKeepAlive", err) //nil err okay
+		return
+	}
+
+	err = tcpconn.SetKeepAlivePeriod(time.Second * 15)
+	if err != nil {
+		log.Println("SetKeepAlivePeriod", err) //nil err okay
+		return
+	}
 
 	err = tcpconn.SetReadDeadline(time.Now().Add(10 * time.Second)) //ping period is 5sec
 	if err != nil {
-		log.Println("ping GR done: ", err) //nil err okay
+		log.Println("SetReadDeadline: ", err) //nil err okay
 		return
 	}
 
@@ -172,16 +97,86 @@ func ftlSession(tcpconn net.Conn) {
 
 	scanner := bufio.NewScanner(tcpconn)
 
-	var l string
-
 	if !scanner.Scan() {
 		reportScannerError(scanner)
 		return
 	}
-	if l = scanner.Text(); l != "HMAC" {
-		log.Println("ftl/no hmac:", l)
+	line := scanner.Text()
+	foo := strings.SplitN(line, " ", 2)
+
+	switch foo[0] {
+	case "HMAC":
+		hmacHandler(tcpconn, scanner)
+	case "REGISTER":
+		registrationHandler(tcpconn, scanner, foo[1])
+	default:
+		log.Println("unknown 1st line:", line)
+	}
+
+}
+func registrationHandler(tcpconn *net.TCPConn, scanner *bufio.Scanner, part2 string) {
+
+	a := struct {
+		SfuInfo
+		Secret string
+	}{}
+
+	err := json.Unmarshal([]byte(part2), &a)
+	if err != nil {
+		log.Println("json.Unmarshal", err)
 		return
 	}
+
+	if a.Secret != *secret {
+		log.Println("invalid secret token", err)
+		return
+	}
+
+	endpointMapMutex.Lock()
+	_, ok := endpointMap[a.Channelid]
+	endpointMapMutex.Unlock()
+
+	if ok {
+		log.Println("hangup: duplicate sfu registration for channelid", a.Channelid)
+		return
+	}
+
+	log.Println("sfu registered chanid/", a.Channelid)
+
+	sfuaddr := tcpconn.LocalAddr().(*net.TCPAddr)
+	sfuaddr2 := &net.UDPAddr{
+		IP:   sfuaddr.IP,
+		Port: 8084,
+		Zone: "",
+	}
+
+	// rtp to sfu socket
+	a.udptx, err = net.DialUDP("udp", nil, sfuaddr2)
+	if err != nil {
+		log.Println("DialUDP", err)
+		return
+	}
+	defer a.udptx.Close()
+
+	endpointMapMutex.Lock()
+	endpointMap[a.Channelid] = &a.SfuInfo
+	endpointMapMutex.Unlock()
+
+	b := make([]byte, 1)
+	//should block until SFU disconnects
+	// when this returns, it is our indication the SFU is done
+	_, err = tcpconn.Read(b)
+	log.Println("tcpconn", err)
+
+	endpointMapMutex.Lock()
+	delete(endpointMap, a.Channelid)
+	endpointMapMutex.Unlock()
+}
+
+func hmacHandler(tcpconn net.Conn, scanner *bufio.Scanner) {
+	var l string
+	var err error
+
 	log.Println("ftl: got hmac")
 
 	if !scanner.Scan() {
@@ -238,7 +233,7 @@ func ftlSession(tcpconn net.Conn) {
 		return
 	}
 
-	good := ValidMAC([]byte(sfuinfo.hmackey), message, client_hash)
+	good := ValidMAC([]byte(sfuinfo.Hmackey), message, client_hash)
 
 	log.Println("ftl: auth is okay:", good)
 

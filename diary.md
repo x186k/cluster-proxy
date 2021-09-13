@@ -26,3 +26,13 @@ plan: switch from current http-retries based sfu registration
 to http-held-open based sfu registration with tcp-keepalives.
 (should be more robust)
 
+# 9/13/21
+moving on from http based registration to tcp based registration
+tcp based registration has the advantage that tcp-keepalives
+can be used for both sides: sfu, proxy to easily detect a disconnected
+other side.
+this means the proxy won't try to forward to a missing/crashed sfu,
+and the sfu won't think it is successfully registered with a missing/crashed proxy.
+
+
+

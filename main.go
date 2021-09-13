@@ -26,9 +26,10 @@ import (
 
 type SfuInfo struct {
 	udptx   *net.UDPConn
-	Hmackey []byte
+	Hmackey string
 }
 
+// must be same as in deadsfu
 type FtlRegistrationInfo struct {
 	Hmackey          string
 	Channelid        string
@@ -39,7 +40,7 @@ type FtlRegistrationInfo struct {
 var endpointMap = make(map[string]*SfuInfo)
 var endpointMapMutex sync.Mutex
 
-var obsProxyPassword = pflag.String("obs-proxy-password", "", "password to register with ftl/obs proxy. required for proxy use")
+var obsProxyPassword = pflag.StringP("obs-proxy-password", "s", "", "password to register with ftl/obs proxy. required for proxy use")
 
 func main() {
 
@@ -87,7 +88,7 @@ func tcpSession(tcpconn *net.TCPConn) {
 		return
 	}
 
-	err = tcpconn.SetKeepAlivePeriod(time.Second * 15)
+	err = tcpconn.SetKeepAlivePeriod(time.Second * 5)
 	if err != nil {
 		log.Println("SetKeepAlivePeriod", err) //nil err okay
 		return
@@ -104,9 +105,10 @@ func tcpSession(tcpconn *net.TCPConn) {
 	scanner := bufio.NewScanner(tcpconn)
 
 	if !scanner.Scan() {
-		reportScannerError(scanner)
+		log.Println("waiting hmac/register: error or eof", scanner.Err())
 		return
 	}
+
 	line := scanner.Text()
 	foo := strings.SplitN(line, " ", 2)
 
@@ -129,6 +131,8 @@ func registrationHandler(tcpconn *net.TCPConn, scanner *bufio.Scanner, part2 str
 		return
 	}
 
+	log.Println(reginfo)
+
 	if reginfo.ObsProxyPassword != *obsProxyPassword {
 		log.Println("invalid obsProxyPassword token", err)
 		return
@@ -147,23 +151,13 @@ func registrationHandler(tcpconn *net.TCPConn, scanner *bufio.Scanner, part2 str
 	sfuaddr := tcpconn.LocalAddr().(*net.TCPAddr)
 	sfuaddr2 := &net.UDPAddr{
 		IP:   sfuaddr.IP,
-		Port: 8084,
+		Port: reginfo.Port,
 		Zone: "",
-	}
-
-	hmacbytes, err := hex.DecodeString(reginfo.Hmackey)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	if len(hmacbytes) != 128 {
-		log.Println("hmac bytes must be 128 bytes long")
-		return
 	}
 
 	a := &SfuInfo{
 		udptx:   &net.UDPConn{},
-		Hmackey: hmacbytes,
+		Hmackey: reginfo.Hmackey,
 	}
 
 	// rtp to sfu socket
@@ -174,6 +168,13 @@ func registrationHandler(tcpconn *net.TCPConn, scanner *bufio.Scanner, part2 str
 	}
 	defer a.udptx.Close()
 
+	// no timeout
+	err = tcpconn.SetReadDeadline(time.Time{}) 
+	if err != nil {
+		log.Println("SetReadDeadline: ", err)
+		return
+	}
+
 	endpointMapMutex.Lock()
 	endpointMap[reginfo.Channelid] = a
 	endpointMapMutex.Unlock()
@@ -182,7 +183,7 @@ func registrationHandler(tcpconn *net.TCPConn, scanner *bufio.Scanner, part2 str
 	// should block until SFU disconnects
 	// when this returns, it is our indication the SFU is done/gone/dead
 	_, err = tcpconn.Read(b)
-	log.Println("tcpconn", err)
+	log.Println("sfu dead/gone: read returned", err)
 
 	endpointMapMutex.Lock()
 	delete(endpointMap, reginfo.Channelid)
@@ -196,7 +197,7 @@ func ftlConnectionHandler(tcpconn net.Conn, scanner *bufio.Scanner) {
 	log.Println("ftl: got hmac")
 
 	if !scanner.Scan() {
-		reportScannerError(scanner)
+		log.Println("waiting blank: error or eof", scanner.Err())
 		return
 	}
 	if l = scanner.Text(); l != "" {
@@ -216,7 +217,7 @@ func ftlConnectionHandler(tcpconn net.Conn, scanner *bufio.Scanner) {
 	fmt.Fprintf(tcpconn, "200 %s\n", hex.EncodeToString(message))
 
 	if !scanner.Scan() {
-		reportScannerError(scanner)
+		log.Println("waiting connect: error or eof", scanner.Err())
 		return
 	}
 
@@ -309,11 +310,12 @@ func ftlConnectionHandler(tcpconn net.Conn, scanner *bufio.Scanner) {
 
 	// PING goroutine
 	go func() {
+		// when the ping goroutine exists, we want to shut everything down
 		defer tcpconn.Close()
 		defer udprx.Close()
 
 		for {
-			err = tcpconn.SetReadDeadline(time.Now().Add(7 * time.Second)) //ping period is 5sec
+			err = tcpconn.SetReadDeadline(time.Now().Add(8 * time.Second)) //ping period is 5sec
 			if err != nil {
 				log.Println("ping GR done: ", scanner.Err()) //nil err okay
 				return
@@ -381,15 +383,6 @@ func ftlConnectionHandler(tcpconn net.Conn, scanner *bufio.Scanner) {
 		}
 	}
 
-}
-
-func reportScannerError(scanner *bufio.Scanner) {
-	err := scanner.Err()
-	if err == nil {
-		log.Println("EOF on OBS/FTL")
-	} else {
-		log.Println(err)
-	}
 }
 
 func ValidMAC(key, message, messageMAC []byte) bool {

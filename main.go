@@ -25,22 +25,28 @@ import (
 )
 
 type SfuInfo struct {
-	udptx     *net.UDPConn
-	Channelid string
-	Hmackey   []byte
+	udptx   *net.UDPConn
+	Hmackey []byte
+}
+
+type FtlRegistrationInfo struct {
+	Hmackey          string
+	Channelid        string
+	Port             int
+	ObsProxyPassword string
 }
 
 var endpointMap = make(map[string]*SfuInfo)
 var endpointMapMutex sync.Mutex
 
-var secret = pflag.StringP("secret", "s", "", "required: secret password for sfu registration")
+var obsProxyPassword = pflag.String("obs-proxy-password", "", "password to register with ftl/obs proxy. required for proxy use")
 
 func main() {
 
 	log.SetFlags(log.LUTC | log.LstdFlags | log.Lshortfile)
 
 	pflag.Parse()
-	if *secret == "" {
+	if *obsProxyPassword == "" {
 		pflag.Usage()
 		return
 	}
@@ -106,48 +112,58 @@ func tcpSession(tcpconn *net.TCPConn) {
 
 	switch foo[0] {
 	case "HMAC":
-		hmacHandler(tcpconn, scanner)
+		ftlConnectionHandler(tcpconn, scanner)
 	case "REGISTER":
 		registrationHandler(tcpconn, scanner, foo[1])
 	default:
-		log.Println("unknown 1st line:", line)
+		log.Println("unrecognized 1st line:", line)
 	}
-
 }
 func registrationHandler(tcpconn *net.TCPConn, scanner *bufio.Scanner, part2 string) {
 
-	a := struct {
-		SfuInfo
-		Secret string
-	}{}
+	reginfo := &FtlRegistrationInfo{}
 
-	err := json.Unmarshal([]byte(part2), &a)
+	err := json.Unmarshal([]byte(part2), reginfo)
 	if err != nil {
 		log.Println("json.Unmarshal", err)
 		return
 	}
 
-	if a.Secret != *secret {
-		log.Println("invalid secret token", err)
+	if reginfo.ObsProxyPassword != *obsProxyPassword {
+		log.Println("invalid obsProxyPassword token", err)
 		return
 	}
 
 	endpointMapMutex.Lock()
-	_, ok := endpointMap[a.Channelid]
+	_, ok := endpointMap[reginfo.Channelid]
 	endpointMapMutex.Unlock()
-
 	if ok {
-		log.Println("hangup: duplicate sfu registration for channelid", a.Channelid)
+		log.Println("hangup: duplicate sfu registration for channelid", reginfo.Channelid)
 		return
 	}
 
-	log.Println("sfu registered chanid/", a.Channelid)
+	log.Println("sfu registered chanid/", reginfo.Channelid)
 
 	sfuaddr := tcpconn.LocalAddr().(*net.TCPAddr)
 	sfuaddr2 := &net.UDPAddr{
 		IP:   sfuaddr.IP,
 		Port: 8084,
 		Zone: "",
+	}
+
+	hmacbytes, err := hex.DecodeString(reginfo.Hmackey)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	if len(hmacbytes) != 128 {
+		log.Println("hmac bytes must be 128 bytes long")
+		return
+	}
+
+	a := &SfuInfo{
+		udptx:   &net.UDPConn{},
+		Hmackey: hmacbytes,
 	}
 
 	// rtp to sfu socket
@@ -159,21 +175,21 @@ func registrationHandler(tcpconn *net.TCPConn, scanner *bufio.Scanner, part2 str
 	defer a.udptx.Close()
 
 	endpointMapMutex.Lock()
-	endpointMap[a.Channelid] = &a.SfuInfo
+	endpointMap[reginfo.Channelid] = a
 	endpointMapMutex.Unlock()
 
 	b := make([]byte, 1)
-	//should block until SFU disconnects
-	// when this returns, it is our indication the SFU is done
+	// should block until SFU disconnects
+	// when this returns, it is our indication the SFU is done/gone/dead
 	_, err = tcpconn.Read(b)
 	log.Println("tcpconn", err)
 
 	endpointMapMutex.Lock()
-	delete(endpointMap, a.Channelid)
+	delete(endpointMap, reginfo.Channelid)
 	endpointMapMutex.Unlock()
 }
 
-func hmacHandler(tcpconn net.Conn, scanner *bufio.Scanner) {
+func ftlConnectionHandler(tcpconn net.Conn, scanner *bufio.Scanner) {
 	var l string
 	var err error
 

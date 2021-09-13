@@ -20,3 +20,9 @@ cause termination will kill all ftl sessions.
 Decision: switch from mondo-udp-forwarder to forwarder-per-session.
 Why: Because the implementation logic is simpler likely more robust.
 
+# 9/12/21
+
+plan: switch from current http-retries based sfu registration
+to http-held-open based sfu registration with tcp-keepalives.
+(should be more robust)
+

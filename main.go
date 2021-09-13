@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/hmac"
 	crand "crypto/rand"
@@ -26,7 +27,7 @@ import (
 )
 
 type SfuInfo struct {
-	tosfu   *net.UDPConn
+	udptx   *net.UDPConn
 	userid  string
 	hmackey []byte
 }
@@ -37,7 +38,7 @@ var endpointMapMutex sync.Mutex
 func httpError(w http.ResponseWriter, err error) {
 	_, fileName, fileLine, _ := runtime.Caller(1)
 	tt := time.Now().Format(time.RFC3339)
-	m := fmt.Sprintf("httperr %v %v %v", filepath.Base(fileName), fileLine, err)
+	m := fmt.Sprintf("ftl-proxy: httperr %v %v %v", filepath.Base(fileName), fileLine, err)
 	log.Print(tt)
 	log.Print(m)
 	http.Error(w, m+" "+tt, http.StatusInternalServerError)
@@ -54,59 +55,7 @@ func main() {
 	pflag.Parse()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc(*registerUrl, func(rw http.ResponseWriter, r *http.Request) {
-		var err error
-
-		if r.PostFormValue("ping") != "" {
-			_, _ = rw.Write([]byte("OK"))
-			return
-		}
-
-		streamkey := r.PostFormValue("streamkey")
-		split := strings.Split(streamkey, "-")
-		if len(split) != 2 {
-			httpError(rw, fmt.Errorf("Invalid stream key, valid example format: 123-abc"))
-			return
-		}
-
-		a := SfuInfo{}
-
-		a.userid = split[0]
-		a.hmackey = []byte(split[1])
-
-		port := r.PostFormValue("port")
-		if port == "" {
-			httpError(rw, fmt.Errorf("port not present/valid in form"))
-			return
-		}
-
-		host, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			httpError(rw, err)
-			return
-		}
-
-		hostport := host + ":" + port
-		log.Printf("sfu registered for user/%v at %v", a.userid, hostport)
-
-		sfuaddr, err := net.ResolveUDPAddr("udp", hostport)
-		if err != nil {
-			httpError(rw, err)
-			return
-		}
-
-		a.tosfu, err = net.DialUDP("udp", nil, sfuaddr)
-		if err != nil {
-			httpError(rw, err)
-			return
-		}
-
-		endpointMapMutex.Lock()
-		endpointMap[a.userid] = &a
-		endpointMapMutex.Unlock()
-
-		_, _ = rw.Write([]byte("OK"))
-	})
+	mux.HandleFunc(*registerUrl, registrationHandler)
 
 	log.Print("starting http listenAndServe() on:", *httphostport, *registerUrl)
 
@@ -125,6 +74,67 @@ func main() {
 
 }
 
+func registrationHandler(rw http.ResponseWriter, r *http.Request) {
+	var err error
+
+	streamkey := r.PostFormValue("streamkey")
+	split := strings.Split(streamkey, "-")
+	if len(split) != 2 {
+		httpError(rw, fmt.Errorf("Invalid stream key, valid example format: 123-abc"))
+		return
+	}
+
+	a := SfuInfo{}
+
+	a.userid = split[0]
+	a.hmackey = []byte(split[1])
+
+	port := r.PostFormValue("port")
+	if port == "" {
+		httpError(rw, fmt.Errorf("port not present/valid in form"))
+		return
+	}
+
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		httpError(rw, err)
+		return
+	}
+
+	endpointMapMutex.Lock()
+	check, ok := endpointMap[a.userid]
+	endpointMapMutex.Unlock()
+
+	if ok {
+		if bytes.Equal(check.hmackey, a.hmackey) && check.userid == a.userid {
+			//log.Println("duplicate sfu registration")
+			_, _ = rw.Write([]byte("OK"))
+			return
+		}
+	}
+
+	hostport := host + ":" + port
+	log.Printf("sfu registered for user/%v at %v", a.userid, hostport)
+
+	sfuaddr, err := net.ResolveUDPAddr("udp", hostport)
+	if err != nil {
+		httpError(rw, err)
+		return
+	}
+
+	a.udptx, err = net.DialUDP("udp", nil, sfuaddr)
+	if err != nil {
+		httpError(rw, err)
+		return
+	}
+
+	endpointMapMutex.Lock()
+	endpointMap[a.userid] = &a
+	endpointMapMutex.Unlock()
+
+	_, _ = rw.Write([]byte("OK"))
+}
+
 func ftlListener() {
 	config := &net.ListenConfig{}
 	ln, err := config.Listen(context.Background(), "tcp4", ":8084")
@@ -140,6 +150,8 @@ func ftlListener() {
 			time.Sleep(time.Second * 10)
 		}
 
+		log.Println("socket accepted")
+
 		go func() {
 			defer c.Close()
 			ftlSession(c)
@@ -149,6 +161,12 @@ func ftlListener() {
 
 func ftlSession(tcpconn net.Conn) {
 	var err error
+
+	err = tcpconn.SetReadDeadline(time.Now().Add(10 * time.Second)) //ping period is 5sec
+	if err != nil {
+		log.Println("ping GR done: ", err) //nil err okay
+		return
+	}
 
 	log.Println("OBS/FTL GOT TCP SOCKET CONNECTION")
 
@@ -208,6 +226,7 @@ func ftlSession(tcpconn net.Conn) {
 	client_hash, err := hex.DecodeString(l[len(connectMsg):])
 	if err != nil {
 		log.Println(err)
+		return
 	}
 
 	endpointMapMutex.Lock()
@@ -230,21 +249,12 @@ func ftlSession(tcpconn net.Conn) {
 
 	fmt.Fprintf(tcpconn, "200\n")
 
-	z := make(chan bool)
-
-	go func() {
-		select {
-		case <-time.NewTimer(5 * time.Second).C:
-			tcpconn.Close()
-			log.Println("ftl: timeout waiting for handshake")
-			return
-		case <-z:
-			log.Println("ftl: handshake complete before timeout")
-		}
-	}()
-
 	kvmap := make(map[string]string)
 
+	err = tcpconn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if err != nil {
+		log.Println(err)
+	}
 	for scanner.Scan() {
 		l = scanner.Text()
 		if l == "." {
@@ -259,11 +269,7 @@ func ftlSession(tcpconn net.Conn) {
 				return
 			}
 		}
-		//fmt.Println(">", l)
 	}
-
-	close(z) //stop key read timeout
-	log.Println("ftl: got k/v set")
 
 	for k, v := range kvmap {
 		log.Println("ftl: key/value", k, v)
@@ -278,131 +284,88 @@ func ftlSession(tcpconn net.Conn) {
 
 	// net.DialUDP("udp",nil,), not yet, cause we don't know remote port
 	x := net.UDPAddr{IP: nil, Port: 0, Zone: ""}
-	udpconn, err := net.ListenUDP("udp", &x)
+	udprx, err := net.ListenUDP("udp", &x)
 	if err != nil {
 		log.Println(err)
 		return
 	}
-	defer udpconn.Close()
+	defer udprx.Close()
 
-	laddr := udpconn.LocalAddr().(*net.UDPAddr)
-
+	laddr := udprx.LocalAddr().(*net.UDPAddr)
 	log.Println("bound inbound udp on", laddr)
 
 	fmt.Fprintf(tcpconn, "200. Use UDP port %d\n", laddr.Port)
 
-	pingchan := make(chan bool)
-	disconnectCh := make(chan bool)
-
 	// PING goroutine
-	// this will silently go away when the socket gets closed
 	go func() {
-		log.Println("ftl: ping responder running")
-		for scanner.Scan() {
+		defer tcpconn.Close()
+		defer udprx.Close()
+
+		for {
+			err = tcpconn.SetReadDeadline(time.Now().Add(7 * time.Second)) //ping period is 5sec
+			if err != nil {
+				log.Println("ping GR done: ", scanner.Err()) //nil err okay
+				return
+			}
+
+			ok := scanner.Scan()
+			if !ok {
+				log.Println("ping GR done: ", scanner.Err()) //nil err okay
+				return
+			}
+
 			l := scanner.Text()
 
-			// XXX PING is sometimes followed by streamkey-id
-			// but we don't validate it.
-			// it is checked for Connect message
 			if strings.HasPrefix(l, "PING ") {
-				log.Println("ftl: ping!")
+				// XXX PING is sometimes followed by streamkey-id
+				// but we don't validate it.
+				// it is checked for Connect message
+				//log.Println("ftl: ping!")
 				fmt.Fprintf(tcpconn, "201\n")
-
-				pingchan <- true
 			} else if l == "" {
 				//ignore blank
 			} else if l == "DISCONNECT" {
-				disconnectCh <- true
+				log.Println("disconnect, ping GR done")
+				return
 			} else {
-				// unexpected
 				log.Println("ftl: unexpected msg:", l)
 			}
 		}
-		//silently finish goroutine on scanner error or socket close
 	}()
 
-	lastping := time.Now()
-	lastudp := time.Now()
 	buf := make([]byte, 2000)
 
-	connected := false
+	nrefused := 0
+
 	for {
-
-		select {
-		case m, more := <-pingchan:
-			if m && more {
-				lastping = time.Now()
-			}
-		case <-disconnectCh:
-			log.Println("OBS/FTL: SERVER DISCONNECTED")
-			return
-		default:
-		}
-		if time.Since(lastping) > time.Second*11 {
-			log.Println("OBS/FTL: PINGING TIMEOUT, CLOSING")
-			return
-		}
-		if time.Since(lastudp) > time.Second*3/2 { // 1.5 second
-			log.Println("OBS/FTL: UDP/RX TIMEOUT, CLOSING")
-			return
-		}
-
-		err = udpconn.SetReadDeadline(time.Now().Add(time.Second))
+		err = udprx.SetReadDeadline(time.Now().Add(time.Second))
 		if err != nil {
 			log.Println(err)
 			return
 		}
 
-		n, readaddr, err := udpconn.ReadFromUDP(buf)
+		n, _, err := udprx.ReadFromUDP(buf)
 		if errors.Is(err, os.ErrDeadlineExceeded) {
-			continue
+			return
 		} else if err != nil {
-			log.Println(fmt.Errorf("OBS/FTL: UDP FAIL, CLOSING: %w", err))
+			log.Println(err)
 			return
 		}
 
-		//this increases security,
-		// and performance too, per this: https://stackoverflow.com/a/51296247/86375
-		//
-		if !connected {
-			connected = true
-
-			err := udpconn.Close()
-			if err != nil {
-				log.Println(err)
-				return
-			}
-			//XXX there may be a 1 in 1e6 race here
-
-			udpconn, err = net.DialUDP("udp", laddr, readaddr)
-			if err != nil {
-				log.Println(err)
-				return
-			}
-		}
-
-		lastudp = time.Now()
+		// not now: udprx, err = net.DialUDP("udp", laddr, readaddr)
 
 		if n < 12 {
 			continue
 		}
 
-		// we could have a single udp forwarder or many
-		// the way I see it is, that
-		// having many makes tcp session management easier
-		//udp timeouts become easy to propagate up the stack
-		// invoking defers etc for cleanup
-		// hopefully simpler, more robust design
-
-		_, err = sfuinfo.tosfu.Write(buf[:n])
+		_, err = sfuinfo.udptx.Write(buf[:n])
 		if err != nil {
 			if errors.Is(err, unix.ECONNREFUSED) { // or windows.WSAECONNRESET
-				log.Printf("sfu %s %s %s not receiving, marking dead",
-					sfuinfo.userid,
-					sfuinfo.tosfu.LocalAddr().String(),
-					sfuinfo.tosfu.RemoteAddr().String(),
-				)
-				continue
+				nrefused++
+				if nrefused > 10 {
+					log.Println("ending session: too many ECONNREFUSED")
+					return
+				}
 			}
 		}
 	}

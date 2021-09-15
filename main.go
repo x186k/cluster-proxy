@@ -45,14 +45,6 @@ func (x *SfuInfo) TakePacket(inf *log.Logger, dbg *log.Logger, pkt []byte) bool 
 	return true //okay
 }
 
-// must be same as in deadsfu
-type FtlRegistrationInfo struct {
-	Hmackey          string
-	Channelid        string
-	Port             int
-	ObsProxyPassword string
-}
-
 var endpointMap = make(map[string]*SfuInfo)
 var endpointMapMutex sync.Mutex
 
@@ -110,7 +102,7 @@ func nothmacCmd(inf *log.Logger, dbg *log.Logger, tokens []string, t *net.TCPCon
 		return
 	}
 
-	reginfo := &FtlRegistrationInfo{}
+	reginfo := &ftlserver.FtlRegistrationInfo{}
 
 	err := json.Unmarshal([]byte(tokens[1]), reginfo)
 	if err != nil {

@@ -1,35 +1,43 @@
 package main
 
 import (
-	"bufio"
-	"context"
-	"encoding/json"
+	"os"
 
 	"errors"
 
 	"log"
 	"net"
 
-	"sync"
 	"time"
 
+	"github.com/gomodule/redigo/redis"
 	"github.com/spf13/pflag"
 	"github.com/x186k/ftlserver"
 	"golang.org/x/sys/unix"
 )
 
 type SfuInfo struct {
-	udptx    *net.UDPConn
-	Hmackey  string
+	udpout   *net.UDPConn
 	nrefused int
 }
 
-func (x *SfuInfo) GetHmackey(inf *log.Logger, dbg *log.Logger) string {
-	return x.Hmackey
+var redisconn redis.Conn
+
+func connectRedis() {
+	var err error
+	url := os.Getenv("REDIS_URL")
+	if url == "" {
+		log.Fatalln("REDIS_URL must be set for cluster mode")
+	}
+	redisconn, err = redis.DialURL(url)
+	if err != nil {
+		log.Fatalln("redis.DialURL(url)", url, err)
+	}
 }
+
 func (x *SfuInfo) TakePacket(inf *log.Logger, dbg *log.Logger, pkt []byte) bool {
 	var err error
-	_, err = x.udptx.Write(pkt)
+	_, err = x.udpout.Write(pkt)
 	if err != nil {
 		if errors.Is(err, unix.ECONNREFUSED) { // or windows.WSAECONNRESET
 			x.nrefused++
@@ -45,23 +53,15 @@ func (x *SfuInfo) TakePacket(inf *log.Logger, dbg *log.Logger, pkt []byte) bool 
 	return true //okay
 }
 
-var endpointMap = make(map[string]*SfuInfo)
-var endpointMapMutex sync.Mutex
-
-var obsProxyPassword = pflag.StringP("obs-proxy-password", "s", "", "password to register with ftl/obs proxy. required for proxy use")
-
 func main() {
 
 	log.SetFlags(log.LUTC | log.LstdFlags | log.Lshortfile)
 
-	pflag.Parse()
-	if *obsProxyPassword == "" {
-		pflag.Usage()
-		return
-	}
+	connectRedis()
 
-	config := &net.ListenConfig{}
-	ln, err := config.Listen(context.Background(), "tcp", ":8084")
+	pflag.Parse()
+
+	ln, err := net.ListenTCP("tcp", &net.TCPAddr{Port: 8084})
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -83,90 +83,47 @@ func main() {
 		go func() {
 			defer netconn.Close()
 			l := log.Default()
-			ftlserver.NewTcpSession(l, l, tcpconn, nothmacCmd, findserver)
+			ftlserver.NewTcpSession(l, l, tcpconn, findserver)
 		}()
 	}
 }
 
-func findserver(inf *log.Logger, dbg *log.Logger, requestChanid string) (ftlserver.FtlServer, bool) {
-	endpointMapMutex.Lock()
-	sfuinfo, ok := endpointMap[requestChanid]
-	endpointMapMutex.Unlock()
-	return sfuinfo, ok
-}
+func findserver(inf *log.Logger, dbg *log.Logger, requestChanid string) (ftlserver.FtlServer, string) {
 
-func nothmacCmd(inf *log.Logger, dbg *log.Logger, tokens []string, t *net.TCPConn, s2 *bufio.Scanner) (retbool bool) {
-
-	if len(tokens) < 2 || tokens[0] != "REGISTER" {
-		inf.Println("Invalid command presented on FTL socket:", tokens[0])
-		return
-	}
-
-	reginfo := &ftlserver.FtlRegistrationInfo{}
-
-	err := json.Unmarshal([]byte(tokens[1]), reginfo)
+	rkey := "user:" + requestChanid
+	mm, err := redis.StringMap(redisconn.Do("hgetall ", rkey))
 	if err != nil {
-		log.Println("json.Unmarshal", err)
-		return false
+		inf.Println("redis.ScanSlice", err)
+		return nil, ""
 	}
 
-	log.Println(reginfo)
-
-	if reginfo.ObsProxyPassword != *obsProxyPassword {
-		log.Println("invalid obsProxyPassword token", err)
-		return false
+	hmackey, ok := mm["ftl.hmackey"]
+	if !ok || hmackey == "" {
+		inf.Println("userid/chanid not registered", requestChanid)
+		return nil, ""
 	}
 
-	endpointMapMutex.Lock()
-	_, ok := endpointMap[reginfo.Channelid]
-	endpointMapMutex.Unlock()
-	if ok {
-		log.Println("hangup: duplicate sfu registration for channelid", reginfo.Channelid)
-		return
+	udpaddrstr, ok := mm["ftl.addr.port"]
+	if !ok || udpaddrstr == "" {
+		inf.Println("missing ftl.addr.port for:", requestChanid)
+		return nil, ""
 	}
 
-	log.Println("sfu registered chanid/", reginfo.Channelid)
-
-	sfuaddr := t.LocalAddr().(*net.TCPAddr)
-	sfuaddr2 := &net.UDPAddr{
-		IP:   sfuaddr.IP,
-		Port: reginfo.Port,
-		Zone: "",
-	}
-
-	a := &SfuInfo{
-		udptx:   &net.UDPConn{},
-		Hmackey: reginfo.Hmackey,
-	}
-
-	// rtp to sfu socket
-	a.udptx, err = net.DialUDP("udp", nil, sfuaddr2)
+	addr, err := net.ResolveUDPAddr("udp", udpaddrstr)
 	if err != nil {
-		log.Println("DialUDP", err)
-		return
+		inf.Println("net.ResolveUDPAddr", err)
+		return nil, ""
 	}
-	defer a.udptx.Close()
 
-	// no timeout
-	err = t.SetReadDeadline(time.Time{})
+	//we make an individual connection to each SFU
+	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
-		log.Println("SetReadDeadline: ", err)
-		return
+		inf.Println("net.Dialudp", err)
+		return nil, ""
 	}
 
-	endpointMapMutex.Lock()
-	endpointMap[reginfo.Channelid] = a
-	endpointMapMutex.Unlock()
+	a := &SfuInfo{udpout: conn}
 
-	b := make([]byte, 1)
-	// should block until SFU disconnects
-	// when this returns, it is our indication the SFU is done/gone/dead
-	_, err = t.Read(b)
-	log.Println("sfu dead/gone: read returned", err)
+	return a, hmackey
 
-	endpointMapMutex.Lock()
-	delete(endpointMap, reginfo.Channelid)
-	endpointMapMutex.Unlock()
-
-	return true //okay
 }

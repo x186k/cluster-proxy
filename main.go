@@ -91,7 +91,7 @@ func main() {
 func findserver(inf *log.Logger, dbg *log.Logger, requestChanid string) (ftlserver.FtlServer, string) {
 
 	rkey := "user:" + requestChanid
-	mm, err := redis.StringMap(redisconn.Do("hgetall ", rkey))
+	mm, err := redis.StringMap(redisconn.Do("hgetall", rkey))
 	if err != nil {
 		inf.Println("redis.ScanSlice", err)
 		return nil, ""

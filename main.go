@@ -90,20 +90,20 @@ func main() {
 
 func findserver(inf *log.Logger, dbg *log.Logger, requestChanid string) (ftlserver.FtlServer, string) {
 
-	rkey := "user:" + requestChanid
+	rkey := "user:" + requestChanid + ":ftl"
 	mm, err := redis.StringMap(redisconn.Do("hgetall", rkey))
 	if err != nil {
 		inf.Println("redis.ScanSlice", err)
 		return nil, ""
 	}
 
-	hmackey, ok := mm["ftl.hmackey"]
+	hmackey, ok := mm["hmackey"]
 	if !ok || hmackey == "" {
 		inf.Println("userid/chanid not registered", requestChanid)
 		return nil, ""
 	}
 
-	udpaddrstr, ok := mm["ftl.addr.port"]
+	udpaddrstr, ok := mm["addr.port"]
 	if !ok || udpaddrstr == "" {
 		inf.Println("missing ftl.addr.port for:", requestChanid)
 		return nil, ""

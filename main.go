@@ -64,21 +64,33 @@ func (x *FtlBackend) TakePacket(inf *log.Logger, dbg *log.Logger, pkt []byte) bo
 	return true //okay
 }
 
+var enableFtlProxy = pflag.Bool("ftl", true, "enable ftl proxy")
+var enableTlsProxy = pflag.Bool("tls", true, "enable tls proxy")
+
+const logflag = log.LUTC | log.LstdFlags | log.Lshortfile
+
+var dbg = log.New(os.Stdout, "D", logflag)
+
 func main() {
 
-	log.SetFlags(log.LUTC | log.LstdFlags | log.Lshortfile)
+	dbg.Println("dbg")
+	log.SetFlags(logflag)
 
 	pool = newRedisPool()
 
 	pflag.Parse()
 
-	go func() {
-		ftlProxy()
-	}()
+	if *enableFtlProxy {
+		go func() {
+			ftlProxy()
+		}()
+	}
 
-	go func() {
-		tcpSniTlsProxy()
-	}()
+	if *enableTlsProxy {
+		go func() {
+			tcpSniTlsProxy()
+		}()
+	}
 
 	select {}
 

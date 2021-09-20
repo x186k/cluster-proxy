@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 
 	"errors"
@@ -16,26 +17,36 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-type SfuInfo struct {
+type FtlBackend struct {
 	udpout   *net.UDPConn
 	nrefused int
 }
 
-var redisconn redis.Conn
-
-func connectRedis() {
-	var err error
-	url := os.Getenv("REDIS_URL")
-	if url == "" {
-		log.Fatalln("REDIS_URL must be set for cluster mode")
-	}
-	redisconn, err = redis.DialURL(url)
-	if err != nil {
-		log.Fatalln("redis.DialURL(url)", url, err)
+func newRedisPool() *redis.Pool {
+	return &redis.Pool{
+		MaxIdle:     3,
+		IdleTimeout: 240 * time.Second,
+		// Dial or DialContext must be set. When both are set, DialContext takes precedence over Dial.
+		Dial: func() (redis.Conn, error) { return newRedisConn() },
 	}
 }
 
-func (x *SfuInfo) TakePacket(inf *log.Logger, dbg *log.Logger, pkt []byte) bool {
+var pool *redis.Pool
+
+func newRedisConn() (redis.Conn, error) {
+	var err error
+	url := os.Getenv("REDIS_URL")
+	if url == "" {
+		return nil, fmt.Errorf("REDIS_URL must be set for cluster mode")
+	}
+	conn, err := redis.DialURL(url)
+	if err != nil {
+		return nil, fmt.Errorf("redis.DialURL, %w", err)
+	}
+	return conn, nil
+}
+
+func (x *FtlBackend) TakePacket(inf *log.Logger, dbg *log.Logger, pkt []byte) bool {
 	var err error
 	_, err = x.udpout.Write(pkt)
 	if err != nil {
@@ -57,10 +68,23 @@ func main() {
 
 	log.SetFlags(log.LUTC | log.LstdFlags | log.Lshortfile)
 
-	connectRedis()
+	pool = newRedisPool()
 
 	pflag.Parse()
 
+	go func() {
+		ftlProxy()
+	}()
+
+	go func() {
+		tcpSniTlsProxy()
+	}()
+
+	select {}
+
+}
+
+func ftlProxy() {
 	ln, err := net.ListenTCP("tcp", &net.TCPAddr{Port: 8084})
 	if err != nil {
 		log.Fatalln(err)
@@ -86,12 +110,16 @@ func main() {
 			ftlserver.NewTcpSession(l, l, tcpconn, findserver)
 		}()
 	}
+	// unreachable code
+	//return
 }
 
 func findserver(inf *log.Logger, dbg *log.Logger, requestChanid string) (ftlserver.FtlServer, string) {
 
+	rc := pool.Get()
+	defer rc.Close()
 	rkey := "user:" + requestChanid + ":ftl"
-	mm, err := redis.StringMap(redisconn.Do("hgetall", rkey))
+	mm, err := redis.StringMap(rc.Do("hgetall", rkey))
 	if err != nil {
 		inf.Println("redis.ScanSlice", err)
 		return nil, ""
@@ -122,7 +150,7 @@ func findserver(inf *log.Logger, dbg *log.Logger, requestChanid string) (ftlserv
 		return nil, ""
 	}
 
-	a := &SfuInfo{udpout: conn}
+	a := &FtlBackend{udpout: conn}
 
 	return a, hmackey
 

@@ -82,10 +82,8 @@ func proxySingleConnection(in net.Conn) {
 	_ = cancel
 
 	newconn := ROConn{reader: io.TeeReader(in, tlsbuf)}
-	/////XXXXXX Go 1.17!!1
-	_ = ctx
-	//_ = tls.Server(newconn, conf).HandshakeContext(ctx)
-	_ = tls.Server(newconn, conf).Handshake()
+
+	_ = tls.Server(newconn, conf).HandshakeContext(ctx) // go 1.17
 
 	log.Println("https connection for:", servername)
 

@@ -149,14 +149,16 @@ func proxySingleConnection(in net.Conn) {
 	wg.Add(2)
 
 	go func() {
+		defer wg.Done()
+
 		_, _ = io.Copy(in, conn2)
 		_ = in.(*net.TCPConn).CloseWrite()
-		wg.Done()
 	}()
 	go func() {
+		defer wg.Done()
+
 		_, _ = io.Copy(conn2, preloadReader)
 		_ = conn2.(*net.TCPConn).CloseWrite()
-		wg.Done()
 	}()
 
 	wg.Wait()

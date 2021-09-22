@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 
 	"errors"
 
@@ -11,7 +14,7 @@ import (
 
 	"time"
 
-	"github.com/gomodule/redigo/redis"
+	redigo "github.com/gomodule/redigo/redis"
 	"github.com/spf13/pflag"
 	"github.com/x186k/ftlserver"
 	"golang.org/x/sys/unix"
@@ -22,28 +25,38 @@ type FtlBackend struct {
 	nrefused int
 }
 
-func newRedisPool() *redis.Pool {
-	return &redis.Pool{
-		MaxIdle:     3,
-		IdleTimeout: 240 * time.Second,
-		// Dial or DialContext must be set. When both are set, DialContext takes precedence over Dial.
-		Dial: func() (redis.Conn, error) { return newRedisConn() },
+var redisPool *redigo.Pool
+var enableFtlProxy = pflag.Bool("ftl", true, "enable ftl proxy")
+var enableTlsProxy = pflag.Bool("tls", true, "enable tls proxy")
+
+const logflag = log.LUTC | log.LstdFlags | log.Lshortfile
+
+var dbg = log.New(os.Stdout, "D", logflag)
+
+func checkFatal(err error) {
+	if err != nil {
+		_, fileName, fileLine, _ := runtime.Caller(1)
+		log.Fatalf("FATAL %s:%d %v", filepath.Base(fileName), fileLine, err)
 	}
 }
+func newRedisPool() {
 
-var pool *redis.Pool
-
-func newRedisConn() (redis.Conn, error) {
-	var err error
 	url := os.Getenv("REDIS_URL")
 	if url == "" {
-		return nil, fmt.Errorf("REDIS_URL must be set for cluster mode")
+		checkFatal(fmt.Errorf("REDIS_URL must be set for cluster mode"))
 	}
-	conn, err := redis.DialURL(url)
-	if err != nil {
-		return nil, fmt.Errorf("redis.DialURL, %w", err)
+
+	redisPool = &redigo.Pool{
+		MaxIdle:     3,
+		IdleTimeout: 5 * time.Second,
+		// Dial or DialContext must be set. When both are set, DialContext takes precedence over Dial.
+		DialContext: func(ctx context.Context) (redigo.Conn, error) {
+			return DialURLContext(ctx, url)
+		},
 	}
-	return conn, nil
+
+	// threadsafe
+	//redisLocker = redislock.New(redislockx.NewRedisLockClient(redisPool))
 }
 
 func (x *FtlBackend) TakePacket(inf *log.Logger, dbg *log.Logger, pkt []byte) bool {
@@ -64,19 +77,12 @@ func (x *FtlBackend) TakePacket(inf *log.Logger, dbg *log.Logger, pkt []byte) bo
 	return true //okay
 }
 
-var enableFtlProxy = pflag.Bool("ftl", true, "enable ftl proxy")
-var enableTlsProxy = pflag.Bool("tls", true, "enable tls proxy")
-
-const logflag = log.LUTC | log.LstdFlags | log.Lshortfile
-
-var dbg = log.New(os.Stdout, "D", logflag)
-
 func main() {
 
 	dbg.Println("dbg")
 	log.SetFlags(logflag)
 
-	pool = newRedisPool()
+	newRedisPool()
 
 	pflag.Parse()
 
@@ -126,30 +132,34 @@ func ftlProxy() {
 	//return
 }
 
-func findserver(inf *log.Logger, dbg *log.Logger, requestChanid string) (ftlserver.FtlServer, string) {
+func findserver(inf *log.Logger, dbg *log.Logger, chanidstr string) (ftlserver.FtlServer, string) {
 
-	rc := pool.Get()
-	defer rc.Close()
-	rkey := "user:" + requestChanid + ":ftl"
-	mm, err := redis.StringMap(rc.Do("hgetall", rkey))
+	rconn := redisPool.Get()
+	defer rconn.Close()
+
+	key1 := "ftl:" + chanidstr + ":lock"
+	key2 := "ftl:" + chanidstr + ":addrport"
+	key3 := "ftl:" + chanidstr + ":hmackey"
+
+	_, err := rconn.Do("get", key1)
 	if err != nil {
-		inf.Println("redis.ScanSlice", err)
+		inf.Println(err)
 		return nil, ""
 	}
 
-	hmackey, ok := mm["hmackey"]
-	if !ok || hmackey == "" {
-		inf.Println("userid/chanid not registered", requestChanid)
+	addrport, err := redigo.String(rconn.Do("get", key2))
+	if err != nil {
+		inf.Println(err)
 		return nil, ""
 	}
 
-	udpaddrstr, ok := mm["addr.port"]
-	if !ok || udpaddrstr == "" {
-		inf.Println("missing ftl.addr.port for:", requestChanid)
+	hmackey, err := redigo.String(rconn.Do("get", key3))
+	if err != nil {
+		inf.Println(err)
 		return nil, ""
 	}
 
-	addr, err := net.ResolveUDPAddr("udp", udpaddrstr)
+	addr, err := net.ResolveUDPAddr("udp", addrport)
 	if err != nil {
 		inf.Println("net.ResolveUDPAddr", err)
 		return nil, ""

@@ -11,6 +11,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	redigo "github.com/gomodule/redigo/redis"
 )
 
 func tcpSniTlsProxy() {
@@ -21,22 +23,25 @@ func tcpSniTlsProxy() {
 	}
 	defer ln.Close()
 
-	for {
-		dbg.Println("443/waiting for accept")
+	log.Println("sni/waiting for accept", ln.Addr())
 
-		netconn, err := ln.Accept()
+	for {
+
+		conn, err := ln.Accept()
 		if err != nil {
 			log.Println(err)
 			time.Sleep(time.Second * 10)
 		}
 
-		dbg.Println("443/socket accepted")
-
-		//	tcpconn := netconn.(*net.TCPConn)
+		dbg.Println("sni/sockacceptee/local/remote", conn.LocalAddr(), conn.RemoteAddr())
 
 		go func() {
-			defer netconn.Close()
-			proxySingleConnection(netconn)
+			defer conn.Close()
+
+			proxySingleConnection(conn)
+
+			dbg.Println("sni/finished/local/remote", conn.LocalAddr(), conn.RemoteAddr())
+
 		}()
 	}
 	// unreachable code
@@ -57,15 +62,32 @@ func (x ROConn) SetDeadline(t time.Time) error      { return nil }
 func (x ROConn) SetReadDeadline(t time.Time) error  { return nil }
 func (x ROConn) SetWriteDeadline(t time.Time) error { return nil }
 
+/*
+there are hard questions, about (and more)
+1. what operations should timeout
+2. the browser wants to hold this open forever, should we let it?
+3. do we use SetReadDeadline(), ctx timeouts or both
+---
+the plan for now:
+- let the browser hold stuff open forever
+- dont use SetReadDeadline()
+- use a ctx.withtimeout to put a timelimit on the setup, but not the proxying
+*/
 func proxySingleConnection(in net.Conn) {
+
+	// time limit to get started
+	// will not interrupt the copying of sockets
+	max := time.Second * 10
+	ctx, cancel := context.WithTimeout(context.Background(), max)
+	defer cancel()
 
 	var err error
 
-	servername := ""
+	domain := ""
 
 	conf := &tls.Config{
 		GetConfigForClient: func(argHello *tls.ClientHelloInfo) (*tls.Config, error) {
-			servername = argHello.ServerName
+			domain = argHello.ServerName
 			return nil, nil
 		},
 	}
@@ -78,14 +100,31 @@ func proxySingleConnection(in net.Conn) {
 
 	tlsbuf := new(bytes.Buffer)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-	_ = cancel
-
 	newconn := ROConn{reader: io.TeeReader(in, tlsbuf)}
 
+	// we dont use the connection, we merely scarf the hostname
 	_ = tls.Server(newconn, conf).HandshakeContext(ctx) // go 1.17
 
-	log.Println("https connection for:", servername)
+	//servername is now available
+
+	log.Println("https connection for:", domain)
+
+	rconn, err := redisPool.GetContext(ctx)
+	if err != nil {
+		log.Println("GetContext", err)
+		return
+	}
+	defer rconn.Close()
+
+	//we dont bother looking for the lock
+	//keyx := "domain:" + domain + ":lock"
+
+	key := "domain:" + domain + ":addrport"
+	addrport, err := redigo.String(rconn.Do("get", key))
+	if err != nil {
+		log.Println("redigo.String(rconn.Do", err)
+		return
+	}
 
 	err = in.SetReadDeadline(time.Time{})
 	if err != nil {
@@ -93,9 +132,13 @@ func proxySingleConnection(in net.Conn) {
 		return
 	}
 
-	conn2, err := net.DialTimeout("tcp", "localhost:8443", 5*time.Second)
+	var d net.Dialer
+
+	// this is the last time we pass ctx on,
+	// so when it times-out, it won't affect later operations
+	conn2, err := d.DialContext(ctx, "tcp", addrport)
 	if err != nil {
-		log.Print(err)
+		log.Printf("Failed to dial: %v", err)
 		return
 	}
 	defer conn2.Close()

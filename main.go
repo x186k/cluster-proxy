@@ -93,9 +93,7 @@ func main() {
 	}
 
 	if *enableTlsProxy {
-		go func() {
-			tcpSniTlsProxy()
-		}()
+		println("nothing here")
 	}
 
 	select {}

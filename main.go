@@ -86,7 +86,7 @@ func main() {
 
 	go ftlProxy()
 
-go httpsProxy()
+	go httpsProxy()
 
 	select {}
 

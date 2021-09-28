@@ -26,8 +26,6 @@ type FtlBackend struct {
 }
 
 var redisPool *redigo.Pool
-var enableFtlProxy = pflag.Bool("ftl", true, "enable ftl proxy")
-var enableTlsProxy = pflag.Bool("tls", true, "enable tls proxy")
 
 const logflag = log.LUTC | log.LstdFlags | log.Lshortfile
 
@@ -86,15 +84,9 @@ func main() {
 
 	pflag.Parse()
 
-	if *enableFtlProxy {
-		go func() {
-			ftlProxy()
-		}()
-	}
+	go ftlProxy()
 
-	if *enableTlsProxy {
-		println("nothing here")
-	}
+go httpsProxy()
 
 	select {}
 

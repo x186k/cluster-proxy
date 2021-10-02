@@ -27,7 +27,7 @@ generate_cert() {
             -CAkey tests/tls/ca.key \
             -CAserial tests/tls/ca.txt \
             -CAcreateserial \
-            -days 365 \
+            -days 36500 \
             $opts \
             -out $certfile
 }
@@ -37,7 +37,7 @@ mkdir -p tests/tls
 openssl req \
     -x509 -new -nodes -sha256 \
     -key tests/tls/ca.key \
-    -days 3650 \
+    -days 36500 \
     -subj '/O=Redis Test/CN=Certificate Authority' \
     -out tests/tls/ca.crt
 

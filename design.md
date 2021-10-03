@@ -34,10 +34,10 @@ There are many, lol.
 
 - no ftl proxy required
 - but! still have these issues:
-- still not a single IP per SFU, but could use port-based URL to avoid any or _continuous_ https-proxying, can simply do a 307-redirect rather than sni-proxying
+- still won't have a single IP per SFU, but could use port-based URL to avoid any or _ongoing_ https-proxying, can simply do a 307-redirect rather than _ongoing_ sni-proxying
 - Actually, for a wildcard cert, we could do an https decode, and 307 redirect.
 - But for non-wildcard certs, we would have to do an SNI proxy, and the target SFU would be required to do a 307 redirect.
-- But!, remember the issue for non-wildcard certs is the letsencrypt load on the TLD. This presents a SPOF for DDOS, or heavy used services.
+- But!, remember the issue for non-wildcard certs is the letsencrypt load on the TLD. This presents a SPOF for DDOS, or issue for heavy used services. (what happens if LE hits rate limits? :( )
 - Also, for wildcard-certs, while the proxy could do a decode and do a 307, it could also do an SNI proxy and let the target SFU do the decode and 307 redirect, which would allow for later doing non-wildcard certs.
 
 

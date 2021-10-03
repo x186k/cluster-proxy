@@ -32,7 +32,7 @@ func httpsProxy() {
 
 	proxy := httputil.NewSingleHostReverseProxy(url)
 
-	err = certmagic.HTTPS([]string{"*.sfu1.com"}, proxy)
+	err = certmagic.HTTPS([]string{"*.deadsfu.com"}, proxy)
 	log.Fatalln("certmagic.https", err)
 
 }

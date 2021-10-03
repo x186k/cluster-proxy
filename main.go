@@ -2,7 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"io/ioutil"
+	"net/url"
+
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,6 +20,7 @@ import (
 	"time"
 
 	redigo "github.com/gomodule/redigo/redis"
+
 	"github.com/spf13/pflag"
 	"github.com/x186k/ftlserver"
 	"golang.org/x/sys/unix"
@@ -39,9 +45,42 @@ func checkFatal(err error) {
 }
 func newRedisPool() {
 
-	url := os.Getenv("REDIS_URL")
-	if url == "" {
+	rurl := os.Getenv("REDIS_URL")
+	if rurl == "" {
 		checkFatal(fmt.Errorf("REDIS_URL must be set for cluster mode"))
+	}
+
+	var do = make([]redigo.DialOption, 0)
+
+	uu, err := url.Parse(rurl)
+	checkFatal(err)
+	_=uu
+
+	redisTls := true
+	if redisTls {
+		cert, err := tls.LoadX509KeyPair("tests/tls/redis.crt", "tests/tls/redis.key")
+		checkFatal(err)
+
+		caCert, err := ioutil.ReadFile("tests/tls/ca.crt")
+		checkFatal(err)
+
+		pool := x509.NewCertPool()
+		pool.AppendCertsFromPEM(caCert)
+
+		//println(99,uu.Hostname())
+
+		tlsconf := &tls.Config{
+			ServerName:   uu.Hostname(),
+			Certificates: []tls.Certificate{cert},
+			RootCAs:      pool,
+			InsecureSkipVerify: false,
+		}
+
+		//do = append(do, redigo.DialUseTLS(true)) //overwritten by DialUrlContext!
+		//do = append(do, redigo.DialTLSSkipVerify(true)) // ignored when providing tlsconf
+		do = append(do, redigo.DialTLSConfig(tlsconf))
+	
+		
 	}
 
 	redisPool = &redigo.Pool{
@@ -49,7 +88,8 @@ func newRedisPool() {
 		IdleTimeout: 5 * time.Second,
 		// Dial or DialContext must be set. When both are set, DialContext takes precedence over Dial.
 		DialContext: func(ctx context.Context) (redigo.Conn, error) {
-			return redigo.DialURLContext(ctx, url)
+			//return redigo.DialContext(ctx, "tcp", uu.Hostname()+":6379", do...)
+			return redigo.DialURLContext(ctx, rurl, do...)
 		},
 	}
 
@@ -100,12 +140,14 @@ func checkRedis() {
 
 	pong, err := redigo.String(rconn.Do("ping"))
 	if err != nil {
-		log.Fatalln("bad TLS", err)
+		log.Fatalln("ping fail", err)
 	}
 
 	if pong != "PONG" {
 		log.Fatalln("redis fail, expect: PONG, got:", pong)
 	}
+
+	dbg.Println("redis ping is good!")
 }
 
 func ftlProxy() {

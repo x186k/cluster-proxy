@@ -23,6 +23,12 @@ There are many, lol.
 - Redis 6 can do TLS, so this is an option
 - The other option is to write an https-proto for SFU registration
 
+### Explore / Redis vs HTTPs registration to proxy
+1. Redis must be 2x-4x quicker to implement than a by-hand HTTPS registration protocol
+2. We will still need Redis anyway (or similar) if we want to community between multiple front-line proxys
+3. For these 2x reasons, it makes sense to just use Redis for both front-line proxy communication AND SFU to proxy communication
+
+
 
 ### thought experiment, what if we didn't support FTL, just HTTPS?
 

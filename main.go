@@ -49,7 +49,7 @@ func newRedisPool() {
 		IdleTimeout: 5 * time.Second,
 		// Dial or DialContext must be set. When both are set, DialContext takes precedence over Dial.
 		DialContext: func(ctx context.Context) (redigo.Conn, error) {
-			return DialURLContext(ctx, url)
+			return redigo.DialURLContext(ctx, url)
 		},
 	}
 
@@ -82,6 +82,8 @@ func main() {
 
 	newRedisPool()
 
+	checkRedis()
+
 	pflag.Parse()
 
 	go ftlProxy()
@@ -90,6 +92,20 @@ func main() {
 
 	select {}
 
+}
+
+func checkRedis() {
+	rconn := redisPool.Get()
+	defer rconn.Close()
+
+	pong, err := redigo.String(rconn.Do("ping"))
+	if err != nil {
+		log.Fatalln("bad TLS", err)
+	}
+
+	if pong != "PONG" {
+		log.Fatalln("redis fail, expect: PONG, got:", pong)
+	}
 }
 
 func ftlProxy() {

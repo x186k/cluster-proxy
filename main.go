@@ -58,7 +58,7 @@ func main() {
 	dbg.Println("dbg")
 	log.SetFlags(logflag)
 
-	newRedisPoolFiles()
+	newRedisPoolCerts(nil, nil, nil, false)
 
 	checkRedis()
 

@@ -1,13 +1,6 @@
 package main
 
 import (
-	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"fmt"
-	"io/ioutil"
-	"net/url"
-
 	"os"
 	"path/filepath"
 	"runtime"
@@ -31,8 +24,6 @@ type FtlBackend struct {
 	nrefused int
 }
 
-var redisPool *redigo.Pool
-
 const logflag = log.LUTC | log.LstdFlags | log.Lshortfile
 
 var dbg = log.New(os.Stdout, "D", logflag)
@@ -42,59 +33,6 @@ func checkFatal(err error) {
 		_, fileName, fileLine, _ := runtime.Caller(1)
 		log.Fatalf("FATAL %s:%d %v", filepath.Base(fileName), fileLine, err)
 	}
-}
-func newRedisPool() {
-
-	rurl := os.Getenv("REDIS_URL")
-	if rurl == "" {
-		checkFatal(fmt.Errorf("REDIS_URL must be set for cluster mode"))
-	}
-
-	var do = make([]redigo.DialOption, 0)
-
-	uu, err := url.Parse(rurl)
-	checkFatal(err)
-	_=uu
-
-	redisTls := true
-	if redisTls {
-		cert, err := tls.LoadX509KeyPair("tests/tls/redis.crt", "tests/tls/redis.key")
-		checkFatal(err)
-
-		caCert, err := ioutil.ReadFile("tests/tls/ca.crt")
-		checkFatal(err)
-
-		pool := x509.NewCertPool()
-		pool.AppendCertsFromPEM(caCert)
-
-		//println(99,uu.Hostname())
-
-		tlsconf := &tls.Config{
-			ServerName:   uu.Hostname(),
-			Certificates: []tls.Certificate{cert},
-			RootCAs:      pool,
-			InsecureSkipVerify: false,
-		}
-
-		//do = append(do, redigo.DialUseTLS(true)) //overwritten by DialUrlContext!
-		//do = append(do, redigo.DialTLSSkipVerify(true)) // ignored when providing tlsconf
-		do = append(do, redigo.DialTLSConfig(tlsconf))
-	
-		
-	}
-
-	redisPool = &redigo.Pool{
-		MaxIdle:     3,
-		IdleTimeout: 5 * time.Second,
-		// Dial or DialContext must be set. When both are set, DialContext takes precedence over Dial.
-		DialContext: func(ctx context.Context) (redigo.Conn, error) {
-			//return redigo.DialContext(ctx, "tcp", uu.Hostname()+":6379", do...)
-			return redigo.DialURLContext(ctx, rurl, do...)
-		},
-	}
-
-	// threadsafe
-	//redisLocker = redislock.New(redislockx.NewRedisLockClient(redisPool))
 }
 
 func (x *FtlBackend) TakePacket(inf *log.Logger, dbg *log.Logger, pkt []byte) bool {
@@ -120,7 +58,7 @@ func main() {
 	dbg.Println("dbg")
 	log.SetFlags(logflag)
 
-	newRedisPool()
+	newRedisPoolFiles()
 
 	checkRedis()
 
@@ -132,22 +70,6 @@ func main() {
 
 	select {}
 
-}
-
-func checkRedis() {
-	rconn := redisPool.Get()
-	defer rconn.Close()
-
-	pong, err := redigo.String(rconn.Do("ping"))
-	if err != nil {
-		log.Fatalln("ping fail", err)
-	}
-
-	if pong != "PONG" {
-		log.Fatalln("redis fail, expect: PONG, got:", pong)
-	}
-
-	dbg.Println("redis ping is good!")
 }
 
 func ftlProxy() {

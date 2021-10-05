@@ -22,6 +22,7 @@ var (
 	redisLocker *redislock.Client
 )
 
+var _ = redisLocker
 var _ = newRedisPoolFiles
 
 func newRedisPoolFiles() {

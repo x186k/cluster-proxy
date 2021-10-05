@@ -17,6 +17,42 @@ There are many, lol.
 - Redis is not easily implemented for 
 - Want to consider DDOS protectability 
 
+### 307 Redirect vs Ongoing HTTP/HTTPS Proxying to Sfus
+
+- 307 redir means adding xyz to deadsfu.com dns records for: xyz.deadsfu.com
+- 307 redir means it's harder to enable CF proxying on ipv4. (6 https ports per ip-addr)
+- 307 Redirecting (to :port) inbound Https traffic to individual Sfus helps dramatically with robustness (no spof processes)
+- 307 redir will require a DNS host record add, if we do host name customization.
+- 307 redirecting rather than ongoing proxying, might help or hinder ddos mitigation
+- (single entry can be easier to protect, but is also a weakness in ddos-land sometimes)
+- If FTL ever goes away, using 307 redirects means there are zero linux-processes spofs in the system graph.
+- 307 means adding ports to urls.
+- ports with urls means there is just six cloudflare ports for https
+- saved urls by users may have a port number which is no longer valid, complicated (but doable)
+- Ongoing proxying over 307, means we *do not have to create dns entries* (doable, but a small pain)
+
+Decision: _ongoing_ http/https proxying, NOT: 307 redir.+dns-reg vs 
+
+
+### wildcard cname design.
+- deadsfux.com.   on cloudflare proxy-only  proxied to A/AAAA
+- deadsfu.com on digitalocean, with @.deadsfu.com/cname to deadsfux.com
+- xyz.deadsfu.com on digitalocean, with cname to deadsfux.com
+
+### cert design.
+- sfu nodes use wildcard dns for deadsfu.com, to avoid letS encrypt rate limits
+- 
+
+
+
+### HTTP vs HTTPS proxying of cluster-entry requests to Sfus
+
+- Http is simply, easy, nice, and clean. Yay!
+- But, HTTP proxying, means _ongoing_ TLS termination at the cluster-entry, foregoing 307 redirects to Sfus.
+- The robustness of doing 307 redirects is super appealing.
+
+Decision: since we are doing 307-redirs, there is zero proxying!!!!
+
 
 ### Explore / SFU to Proxy Signalling
 - Redis is nice and easy, but not well suited for wide-area systems. (traditionally in-the-clear auth passwd)
@@ -40,6 +76,10 @@ There are many, lol.
 - But!, remember the issue for non-wildcard certs is the letsencrypt load on the TLD. This presents a SPOF for DDOS, or issue for heavy used services. (what happens if LE hits rate limits? :( )
 - Also, for wildcard-certs, while the proxy could do a decode and do a 307, it could also do an SNI proxy and let the target SFU do the decode and 307 redirect, which would allow for later doing non-wildcard certs.
 
+
+### Thought experiment, an ipv6 world without FTL
+
+- the cluster-root just does a 307-redir to an ipv6 address, along with a DNS registration.
 
 
 ## Decisions
